@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>チャリ走</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        -webkit-tap-highlight-color: transparent;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #87ceeb;
+        font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif;
+        touch-action: none;
+        user-select: none;
+      }
+      #game {
+        display: block;
+        width: 100%;
+        height: 100%;
+        cursor: pointer;
+      }
+      #hud {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        right: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        pointer-events: none;
+        z-index: 2;
+      }
+      #hud .panel {
+        background: rgba(0, 0, 0, 0.45);
+        color: #fff;
+        padding: 8px 14px;
+        border-radius: 10px;
+        font-size: 14px;
+        font-weight: 600;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+      }
+      #hud .score {
+        font-size: 22px;
+        font-variant-numeric: tabular-nums;
+      }
+      #hud .hint {
+        font-size: 12px;
+        font-weight: 500;
+        opacity: 0.9;
+        text-align: right;
+        max-width: 55%;
+      }
+      #overlay,
+      #pause-overlay {
+        position: fixed;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        text-align: center;
+        padding: 24px;
+      }
+      #overlay {
+        background: rgba(0, 0, 0, 0.55);
+        z-index: 3;
+      }
+      #pause-overlay {
+        background: rgba(0, 0, 0, 0.45);
+        z-index: 4;
+        pointer-events: none;
+      }
+      #overlay.show,
+      #pause-overlay.show {
+        display: flex;
+      }
+      #overlay h2,
+      #pause-overlay h2 {
+        font-size: 2rem;
+        margin-bottom: 8px;
+      }
+      #overlay p,
+      #pause-overlay p {
+        font-size: 1rem;
+        opacity: 0.9;
+        margin-bottom: 6px;
+      }
+      #overlay .final-score {
+        font-size: 1.5rem;
+        font-weight: 700;
+        margin: 16px 0 24px;
+      }
+      #overlay button {
+        pointer-events: auto;
+        border: none;
+        padding: 14px 32px;
+        font-size: 1.1rem;
+        font-weight: 700;
+        border-radius: 12px;
+        background: #fbbf24;
+        color: #1a1a1a;
+        cursor: pointer;
+        box-shadow: 0 4px 0 #b45309;
+      }
+      #overlay button:active {
+        transform: translateY(2px);
+        box-shadow: 0 2px 0 #b45309;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div id="hud">
+      <div class="panel score"><span id="dist">0</span> m</div>
+      <div class="panel hint">スペース / タップでジャンプ<br />2段目は奈落の上でもOK · Escでポーズ</div>
+    </div>
+    <div id="pause-overlay">
+      <h2>ポーズ</h2>
+      <p>Esc キーでもう一度押すと再開</p>
+    </div>
+    <div id="overlay">
+      <h2>奈落に落下！</h2>
+      <p>ジャンプで飛び越えよう</p>
+      <p class="final-score">走行距離: <span id="final-dist">0</span> m</p>
+      <button type="button" id="restart-btn">もう一度</button>
+      <p style="margin-top: 16px; font-size: 0.85rem">スペース / タップでも再開</p>
+    </div>
+    <script>
+      (function () {
+        const canvas = document.getElementById("game");
+        const ctx = canvas.getContext("2d");
+        const distEl = document.getElementById("dist");
+        const finalDistEl = document.getElementById("final-dist");
+        const overlay = document.getElementById("overlay");
+        const pauseOverlay = document.getElementById("pause-overlay");
+        const restartBtn = document.getElementById("restart-btn");
+
+        const SEG_W = 22;
+        const GAP = null;
+        const PIT_DEPTH = 130;
+        const GRAVITY = 0.38;
+        const DRIVE = 0.14;
+        const MIN_GROUND_SPEED = 4.2;
+        const MAX_SPEED = 8;
+        const JUMP_V = -8.4;
+        const WHEEL_R = 7;
+        const WHEELBASE = 40;
+        const FRAME_H = 20;
+        const GROUND_FRICTION = 0.88;
+        const AIR_DAMP = 0.996;
+        const GROUND_ZONE_ABOVE = 70;
+        const GROUND_ZONE_BELOW = 90;
+        const MAX_JUMPS = 2;
+        const TERRAIN_AMP = 28;
+        const TERRAIN_SMOOTH = 0.58;
+        const SAFE_START_SEG = 55;
+        const INIT_FLAT_SEG = 60;
+        const MIN_GAP_INTERVAL = 28;
+        const MIN_GAP_SEG = 5;
+        const MAX_GAP_SEG = 11;
+        const DIFFICULTY_RAMP_M = 500;
+        const GAP_CHANCE_MIN = 0.02;
+        const GAP_CHANCE_MAX = 0.085;
+        const TERRAIN_AHEAD_SEG = 200;
+        const CAM_LERP = 0.14;
+        const FIXED_STEP_MS = 1000 / 60;
+
+        let W, H, groundY;
+        let terrain = [];
+        let terrainLen = 0;
+        let segSinceGap = 0;
+        let gapCooldown = 0;
+        let seed = 12345;
+
+        const bike = {
+          x: 120,
+          y: 0,
+          vx: 3,
+          vy: 0,
+          angle: 0,
+          omega: 0,
+          grounded: false,
+          onSolid: true,
+          airTime: 0,
+        };
+
+        let camX = 0;
+        let drawCamX = 0;
+        let distance = 0;
+        let alive = true;
+        let paused = false;
+        let jumpsLeft = MAX_JUMPS;
+        let wasOnSolid = false;
+        let terrainBufferedTo = 0;
+        let lastTime = 0;
+        let simAccumulator = 0;
+        let overGap = false;
+
+        function rand() {
+          seed = (seed * 16807 + 0) % 2147483647;
+          return (seed & 0x7fffffff) / 2147483647;
+        }
+
+        function resize() {
+          W = canvas.width = window.innerWidth;
+          H = canvas.height = window.innerHeight;
+          groundY = H * 0.74;
+        }
+
+        function segIndex(worldX) {
+          return Math.floor(worldX / SEG_W);
+        }
+
+        function isGapAt(i) {
+          return i >= 0 && i < terrainLen && terrain[i] === GAP;
+        }
+
+        function extendTerrainAhead() {
+          const need = Math.max(
+            INIT_FLAT_SEG + 80,
+            segIndex(bike.x) + TERRAIN_AHEAD_SEG,
+            Math.ceil((W * 4) / SEG_W) + 60
+          );
+          if (need > terrainBufferedTo) {
+            ensureTerrain(need);
+            terrainBufferedTo = need;
+          }
+        }
+
+        function distanceAtSeg(i) {
+          return Math.max(0, Math.floor((i * SEG_W - 120) / 10));
+        }
+
+        function difficultyAtSeg(i) {
+          return Math.min(1, distanceAtSeg(i) / DIFFICULTY_RAMP_M);
+        }
+
+        function gapChanceAtSeg(i) {
+          const t = difficultyAtSeg(i);
+          return GAP_CHANCE_MIN + (GAP_CHANCE_MAX - GAP_CHANCE_MIN) * t;
+        }
+
+        function minGapIntervalAtSeg(i) {
+          const t = difficultyAtSeg(i);
+          return Math.max(14, MIN_GAP_INTERVAL - Math.floor(t * 14));
+        }
+
+        function maxGapSegAtSeg(i) {
+          const t = difficultyAtSeg(i);
+          return MIN_GAP_SEG + Math.floor(t * (MAX_GAP_SEG - MIN_GAP_SEG + 2));
+        }
+
+        function ensureTerrain(untilSeg) {
+          while (terrainLen <= untilSeg) {
+            const i = terrainLen;
+            if (i < INIT_FLAT_SEG) {
+              terrain[i] = 0;
+              terrainLen++;
+              segSinceGap++;
+              continue;
+            }
+            if (gapCooldown > 0) {
+              terrain[i] = GAP;
+              gapCooldown--;
+              if (gapCooldown === 0) segSinceGap = 0;
+              terrainLen++;
+              continue;
+            }
+            let h = 0;
+            if (i > 0 && terrain[i - 1] !== GAP) {
+              const prev = terrain[i - 1];
+              const n = rand() * 2 - 1;
+              const n2 = i > 2 && terrain[i - 2] !== GAP ? terrain[i - 2] : prev;
+              h = prev * TERRAIN_SMOOTH + n * TERRAIN_AMP * (1 - TERRAIN_SMOOTH);
+              h += (n2 - prev) * 0.06;
+            }
+            const minInterval = minGapIntervalAtSeg(i);
+            const canGap =
+              i > SAFE_START_SEG &&
+              segSinceGap > minInterval &&
+              rand() < gapChanceAtSeg(i);
+            if (canGap) {
+              const maxGap = maxGapSegAtSeg(i);
+              gapCooldown =
+                MIN_GAP_SEG + Math.floor(rand() * (maxGap - MIN_GAP_SEG + 1));
+              terrain[i] = GAP;
+              terrainLen++;
+              continue;
+            }
+            terrain[i] = h;
+            segSinceGap++;
+            terrainLen++;
+          }
+        }
+
+        function groundHeight(worldX) {
+          const i0 = segIndex(Math.max(0, worldX));
+          const i1 = i0 + 1;
+          ensureTerrain(i1 + 4);
+          if (isGapAt(i0) || isGapAt(i1)) return null;
+          const t = worldX / SEG_W - i0;
+          const h0 = terrain[i0];
+          const h1 = terrain[i1];
+          if (h0 === GAP || h1 === GAP) return null;
+          if (typeof h0 !== "number" || typeof h1 !== "number") return 0;
+          return h0 + (h1 - h0) * t;
+        }
+
+        function groundSlope(worldX) {
+          const dx = 6;
+          const h1 = groundHeight(worldX - dx);
+          const h2 = groundHeight(worldX + dx);
+          if (h1 === null || h2 === null) return 0;
+          return Math.atan2(h2 - h1, dx * 2);
+        }
+
+        function pitFloorY() {
+          return groundY + PIT_DEPTH;
+        }
+
+        function wheelPos(rear) {
+          if (rear) return { x: bike.x, y: bike.y };
+          return { x: bike.x + WHEELBASE, y: bike.y };
+        }
+
+        function wheelTargetY(wx) {
+          const gh = groundHeight(wx);
+          if (gh === null) return null;
+          return groundY + gh - WHEEL_R;
+        }
+
+        function surfaceAt(wx) {
+          const gh = groundHeight(wx);
+          if (gh === null) return null;
+          return { surfaceY: groundY + gh, slope: groundSlope(wx) };
+        }
+
+        function wheelsOverGap() {
+          return (
+            groundHeight(bike.x) === null &&
+            groundHeight(bike.x + WHEELBASE) === null
+          );
+        }
+
+        function isOverPit() {
+          return wheelsOverGap();
+        }
+
+        function isNearPitAhead() {
+          const end = segIndex(bike.x + WHEELBASE + 150);
+          ensureTerrain(end + 3);
+          for (let i = segIndex(bike.x); i <= end; i++) {
+            if (isGapAt(i)) return true;
+          }
+          return false;
+        }
+
+        function isBridgingNarrowPit() {
+          const rearGap = groundHeight(bike.x) === null;
+          const frontGap = groundHeight(bike.x + WHEELBASE) === null;
+          return rearGap !== frontGap;
+        }
+
+        function isFullyOnSolid() {
+          return (
+            groundHeight(bike.x) !== null &&
+            groundHeight(bike.x + WHEELBASE) !== null
+          );
+        }
+
+        function lowestSolidSurfaceY() {
+          let best = Infinity;
+          for (const wx of [bike.x, bike.x + WHEELBASE]) {
+            const gh = groundHeight(wx);
+            if (gh === null) continue;
+            best = Math.min(best, groundY + gh - WHEEL_R);
+          }
+          return best === Infinity ? null : best;
+        }
+
+        function isInGroundZone() {
+          if (isOverPit()) return false;
+          const surfaceY = lowestSolidSurfaceY();
+          if (surfaceY === null) return false;
+          const rel = bike.y - surfaceY;
+          return rel >= -GROUND_ZONE_ABOVE && rel <= GROUND_ZONE_BELOW;
+        }
+
+        function canUseAirJump() {
+          return isOverPit() || isNearPitAhead() || !isInGroundZone();
+        }
+
+        function updateSolidAndJumps() {
+          const onSolid = isInGroundZone();
+          if (onSolid && !wasOnSolid) jumpsLeft = MAX_JUMPS;
+          wasOnSolid = onSolid;
+          bike.onSolid = onSolid;
+        }
+
+        function shouldResolveWheel(wx) {
+          if (groundHeight(wx) === null) return false;
+          if (isBridgingNarrowPit()) return false;
+          return true;
+        }
+
+        function resolveWheel(wx, wy) {
+          const targetY = wheelTargetY(wx);
+          if (targetY === null) return false;
+          if (wy > targetY) {
+            bike.y -= wy - targetY;
+            bike.vy = Math.min(bike.vy, 0) * GROUND_FRICTION;
+            bike.vx += DRIVE;
+            return true;
+          }
+          return false;
+        }
+
+        function snapToGround() {
+          const rearY = wheelTargetY(bike.x);
+          const frontY = wheelTargetY(bike.x + WHEELBASE);
+          if (rearY !== null && frontY !== null) bike.y = Math.min(rearY, frontY);
+          else if (rearY !== null) bike.y = rearY;
+          else if (frontY !== null) bike.y = frontY;
+          bike.angle = 0;
+          bike.omega = 0;
+        }
+
+        function isFallingInPit() {
+          if (isFullyOnSolid()) return false;
+          if (isBridgingNarrowPit()) return true;
+          if (isOverPit() && bike.vy > 0.5) return true;
+          return false;
+        }
+
+        function checkDeath() {
+          const front = wheelPos(false);
+          const lowestY = Math.max(bike.y, front.y);
+          if (lowestY >= pitFloorY() + WHEEL_R - 1) return { type: "pit" };
+          return null;
+        }
+
+        function togglePause() {
+          if (!alive) return;
+          paused = !paused;
+          pauseOverlay.classList.toggle("show", paused);
+        }
+
+        function gameOver() {
+          alive = false;
+          paused = false;
+          pauseOverlay.classList.remove("show");
+          finalDistEl.textContent = distance;
+          overlay.classList.add("show");
+        }
+
+        function doJump() {
+          bike.vy = JUMP_V;
+          bike.grounded = false;
+          bike.onSolid = false;
+          bike.angle = 0;
+          bike.omega = 0;
+        }
+
+        function tryJump() {
+          if (paused) return;
+          if (!alive) {
+            restart();
+            return;
+          }
+          if (jumpsLeft <= 0) return;
+          const onGroundZone = isInGroundZone();
+          if (jumpsLeft === MAX_JUMPS) {
+            if (onGroundZone) {
+              doJump();
+              jumpsLeft--;
+            }
+            return;
+          }
+          if (jumpsLeft === 1 && canUseAirJump()) {
+            doJump();
+            jumpsLeft--;
+          }
+        }
+
+        function update() {
+          if (!alive || paused) return;
+          extendTerrainAhead();
+          const inPitFall = isFallingInPit();
+          const fullyOnSolid = isFullyOnSolid();
+
+          bike.vy += GRAVITY;
+          if (fullyOnSolid && !inPitFall) {
+            bike.vx += DRIVE * 0.35;
+            if (bike.vx > MAX_SPEED) bike.vx = MAX_SPEED;
+          }
+
+          bike.x += bike.vx;
+          bike.y += bike.vy;
+          bike.angle = 0;
+          bike.omega = 0;
+
+          const rear = wheelPos(true);
+          const front = wheelPos(false);
+          const gRear = shouldResolveWheel(rear.x) ? resolveWheel(rear.x, rear.y) : false;
+          const gFront = shouldResolveWheel(front.x)
+            ? resolveWheel(front.x, front.y)
+            : false;
+          overGap = wheelsOverGap();
+
+          if (fullyOnSolid && !inPitFall && (gRear || gFront)) snapToGround();
+
+          updateSolidAndJumps();
+          bike.grounded = bike.onSolid || gRear || gFront;
+
+          if (inPitFall) {
+            bike.airTime++;
+          } else if (bike.grounded && bike.onSolid) {
+            bike.vx = Math.max(bike.vx, MIN_GROUND_SPEED);
+            bike.airTime = 0;
+          } else {
+            bike.vx *= AIR_DAMP;
+            bike.airTime++;
+            if (fullyOnSolid && bike.vx < MIN_GROUND_SPEED * 0.6) {
+              bike.vx += DRIVE * 0.5;
+            }
+          }
+
+          distance = Math.max(distance, Math.floor((bike.x - 120) / 10));
+          distEl.textContent = distance;
+          const targetCamX = bike.x - W * 0.3;
+          camX += (targetCamX - camX) * CAM_LERP;
+          drawCamX = Math.round(camX);
+          if (checkDeath()) gameOver();
+        }
+
+        function drawSky() {
+          const g = ctx.createLinearGradient(0, 0, 0, H);
+          g.addColorStop(0, "#4a9fe8");
+          g.addColorStop(0.45, "#87ceeb");
+          g.addColorStop(1, "#b8e8a8");
+          ctx.fillStyle = g;
+          ctx.fillRect(0, 0, W, H);
+
+          const sunX = W * 0.82;
+          const sunY = H * 0.16;
+          const sunR = Math.min(W, H) * 0.07;
+          const glow = ctx.createRadialGradient(sunX, sunY, sunR * 0.2, sunX, sunY, sunR * 3.2);
+          glow.addColorStop(0, "rgba(255, 248, 200, 0.95)");
+          glow.addColorStop(0.35, "rgba(255, 220, 100, 0.4)");
+          glow.addColorStop(1, "rgba(255, 220, 100, 0)");
+          ctx.fillStyle = glow;
+          ctx.beginPath();
+          ctx.arc(sunX, sunY, sunR * 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#ffeb3b";
+          ctx.beginPath();
+          ctx.arc(sunX, sunY, sunR, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = "rgba(255,255,255,0.85)";
+          [
+            [drawCamX * 0.15 + 80, 70, 45],
+            [drawCamX * 0.12 + 280, 110, 32],
+            [drawCamX * 0.1 + 520, 55, 38],
+          ].forEach(([cx, cy, r]) => {
+            const sx = cx - drawCamX * 0.08;
+            ctx.beginPath();
+            ctx.arc(sx, cy, r, 0, Math.PI * 2);
+            ctx.arc(sx + r * 0.9, cy - 6, r * 0.65, 0, Math.PI * 2);
+            ctx.arc(sx + r * 1.6, cy, r * 0.8, 0, Math.PI * 2);
+            ctx.fill();
+          });
+        }
+
+        function segScreenX(i) {
+          return i * SEG_W - drawCamX;
+        }
+
+        function drawTerrain() {
+          const startI = Math.max(0, segIndex(drawCamX - 60));
+          const endI = Math.min(terrainLen - 1, segIndex(drawCamX + W + 100));
+          let runStart = -1;
+          for (let i = startI; i <= endI + 1; i++) {
+            const solid = i <= endI && !isGapAt(i);
+            if (solid && runStart < 0) runStart = i;
+            if ((!solid || i > endI) && runStart >= 0) {
+              const runEnd = i - 1;
+              ctx.fillStyle = "#3d8f4a";
+              ctx.strokeStyle = "#1e5c28";
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              const x0 = segScreenX(runStart);
+              ctx.moveTo(x0, groundY + terrain[runStart]);
+              for (let j = runStart; j <= runEnd; j++) {
+                ctx.lineTo(segScreenX(j), groundY + terrain[j]);
+              }
+              const x1 = segScreenX(runEnd);
+              ctx.lineTo(x1, H);
+              ctx.lineTo(x0, H);
+              ctx.closePath();
+              ctx.fill();
+              ctx.stroke();
+              ctx.strokeStyle = "#6ecf7a";
+              ctx.lineWidth = 3;
+              ctx.beginPath();
+              for (let j = runStart; j <= runEnd; j++) {
+                const sx = segScreenX(j);
+                const sy = groundY + terrain[j];
+                if (j === runStart) ctx.moveTo(sx, sy);
+                else ctx.lineTo(sx, sy);
+              }
+              ctx.stroke();
+              runStart = -1;
+            }
+          }
+        }
+
+        function drawBike() {
+          const rx = bike.x - drawCamX;
+          const ry = bike.y;
+          ctx.save();
+          ctx.translate(rx, ry);
+          const drawWheel = (lx) => {
+            ctx.fillStyle = "#222";
+            ctx.beginPath();
+            ctx.arc(lx, 0, WHEEL_R, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = "#999";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          };
+          drawWheel(0);
+          drawWheel(WHEELBASE);
+          ctx.strokeStyle = "#e11d48";
+          ctx.lineWidth = 3;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(3, -3);
+          ctx.lineTo(WHEELBASE - 3, -4);
+          ctx.stroke();
+          ctx.strokeStyle = "#1e293b";
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.moveTo(WHEELBASE * 0.35, -6);
+          ctx.lineTo(WHEELBASE * 0.35, -FRAME_H);
+          ctx.stroke();
+          ctx.fillStyle = "#fbbf24";
+          ctx.beginPath();
+          ctx.arc(WHEELBASE * 0.35, -FRAME_H - 6, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        function draw() {
+          drawSky();
+          drawTerrain();
+          drawBike();
+        }
+
+        function loop(t) {
+          if (lastTime === 0) lastTime = t;
+          const frameMs = Math.min(t - lastTime, 50);
+          lastTime = t;
+          simAccumulator += frameMs;
+          while (simAccumulator >= FIXED_STEP_MS) {
+            update();
+            simAccumulator -= FIXED_STEP_MS;
+          }
+          draw();
+          requestAnimationFrame(loop);
+        }
+
+        function placeBikeOnGround() {
+          const rearY = wheelTargetY(bike.x);
+          bike.y = rearY !== null ? rearY : groundY - WHEEL_R;
+          bike.angle = 0;
+          bike.omega = 0;
+          bike.vy = 0;
+          bike.grounded = true;
+          bike.onSolid = true;
+        }
+
+        function restart() {
+          seed = (Date.now() & 0xffff) + Math.floor(Math.random() * 9999);
+          terrain = [];
+          terrainLen = 0;
+          segSinceGap = 0;
+          gapCooldown = 0;
+          bike.x = 120;
+          bike.vx = MIN_GROUND_SPEED;
+          bike.airTime = 0;
+          distance = 0;
+          alive = true;
+          jumpsLeft = MAX_JUMPS;
+          wasOnSolid = false;
+          overGap = false;
+          terrainBufferedTo = 0;
+          simAccumulator = 0;
+          lastTime = 0;
+          camX = bike.x - W * 0.3;
+          drawCamX = Math.round(camX);
+          distEl.textContent = "0";
+          overlay.classList.remove("show");
+          paused = false;
+          pauseOverlay.classList.remove("show");
+          extendTerrainAhead();
+          placeBikeOnGround();
+          wasOnSolid = true;
+          jumpsLeft = MAX_JUMPS;
+        }
+
+        window.addEventListener("resize", () => {
+          resize();
+          terrainBufferedTo = 0;
+          if (alive) {
+            extendTerrainAhead();
+            placeBikeOnGround();
+          }
+        });
+        window.addEventListener("keydown", (e) => {
+          if (e.code === "Escape") {
+            e.preventDefault();
+            togglePause();
+            return;
+          }
+          if (paused) return;
+          if (e.code === "Space" || e.code === "ArrowUp") {
+            e.preventDefault();
+            tryJump();
+          }
+          if (!alive && (e.code === "Enter" || e.code === "KeyR")) restart();
+        });
+        canvas.addEventListener(
+          "pointerdown",
+          (e) => {
+            e.preventDefault();
+            if (paused) return;
+            tryJump();
+          },
+          { passive: false }
+        );
+        restartBtn.addEventListener("click", restart);
+        resize();
+        restart();
+        requestAnimationFrame(loop);
+      })();
+    </script>
+  </body>
+</html>
